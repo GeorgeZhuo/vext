@@ -1,3 +1,6 @@
+// Simplevt.c
+// (c) Martin Thomas 2010
+
 #include <sqlite3ext.h>
 SQLITE_EXTENSION_INIT1
 
@@ -8,6 +11,7 @@ SQLITE_EXTENSION_INIT1
 #include <fcntl.h>
 #include <sys/errno.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <assert.h>
 // helpful macros
 #define DP  printf("simplevt: %s [line %d]\n", __FUNCTION__, __LINE__);
@@ -22,11 +26,9 @@ typedef struct simplevt_col simplevt_col;
 struct simplevt_col {
 	char *filename;
 	char type;
-	int fd;
 	void *last_mmap;
 	off_t mmap_size;
 	off_t mmap_pos;
-	FILE* lasttext;
 };
 
 /* A simplevt table object */
@@ -48,6 +50,7 @@ struct simplevt_cursor {
   off_t mmap_size;
   off_t mmap_pos;
   int max_rowid; // this should be same as table max_rowid until columns can be updated
+  int metafd;
   FILE* lasttext;
 };
 
@@ -83,32 +86,41 @@ void constructMetaData(int fcnt, simplevt_col** cols)
 		printf ("type: %c\n", cols[idx]->type);
 		assert( (cols[idx]->type == 't') || (cols[idx]->type =='i'));
 		if (cols[idx]->type == 't'){
-			printf ("idx: %i\n", idx);
+			printf ("colidx: %i\n", idx);
 			//create metadata file and write
 			//scan lines
 			FILE* ifile = fopen(cols[idx]->filename, "r");
 			char* metafilename = strdup(cols[idx]->filename);
 			strcat(metafilename, ".meta");
-			FILE* ofile = fopen(metafilename, "w");
-			int linecnt = 0;
-			int conv = 0;
-			char noddy[4096];
-			do
-			{
-				int start = ftell(ifile);
-				conv = fscanf(ifile, "%[:;!?a-zA-Z0-9.,/ -]", noddy);
-				assert(conv);
-				assert(strlen(noddy));
-				if (conv){
-					linecnt++;
-					fwrite(&start, sizeof(start), 1, ofile);
-				}
-//				printf("%s\n", noddy);
-				fseek(ifile, 1, SEEK_CUR);
-			} while (!feof(ifile) && conv == 1);
-			printf("Line count: %i\n", linecnt);
+			//for now we look to see if the metadata file already exists.. later check if it is newer than the text file
+			struct stat rest;
+			int stat_result = stat(metafilename, &rest);
+			if (-1 == stat_result){
+				perror("Stat");
+				FILE* ofile = fopen(metafilename, "w");
+				int linecnt = 0;
+				int conv = 0;
+				char noddy[4096];
+				do
+				{
+					int start = ftell(ifile);
+					conv = fscanf(ifile, "%[:;!?a-zA-Z0-9.,/ -]", noddy);
+					assert(conv);
+					assert(strlen(noddy));
+					if (1 == conv){
+						linecnt++;
+						fwrite(&start, sizeof(start), 1, ofile);
+						printf ("idx: %i, %s\n", start, noddy);
+					}
+	//				printf("%s\n", noddy);
+					fseek(ifile, 1, SEEK_CUR);
+				} while (!feof(ifile) && conv == 1);
+				printf("Line count: %i\n", linecnt);
 
-			fclose(ofile);
+				fclose(ofile);
+			} else {
+				printf ("File exists\n");
+			}
 			fclose(ifile);
 			free(metafilename);
 		}
@@ -328,6 +340,18 @@ int openColumn(sqlite3_vtab_cursor* cur, int colidx){
 		perror("Column file open");
 		rc = SQLITE_ERROR;
 	}
+
+	if (tab->cols[colidx]->type == 't'){
+		printf("Need meta\n");
+		char* metafilename = strdup(tab->cols[colidx]->filename);
+		strcat(metafilename, ".meta");
+		fd = open(metafilename, O_RDONLY);
+		if (-1 != fd){
+			svt_cur->metafd = fd;
+			printf("New meta fd: %i for col %i\n", fd, colidx);
+		} else perror ("meta fail");
+		free(metafilename);
+	}
 	printf("[%s] fd[%i]: %i filename %s\n ", __FUNCTION__, colidx, svt_cur->filedesc[colidx], tab->cols[colidx]->filename);
 	return rc;
 }
@@ -357,7 +381,8 @@ int simplevtClose(sqlite3_vtab_cursor* cur){
 			}
 		}
 	}
-
+  if (svt_cur->metafd)
+	  close(svt_cur->metafd);
   sqlite3_free(cur);
   return rc;
 }
@@ -401,12 +426,12 @@ int simplevtEof(sqlite3_vtab_cursor *cur){
 
 
 int simplevtColumn(sqlite3_vtab_cursor *cur, sqlite3_context *ctx , int colid){
-	DP; // debug print
+//	DP; // debug print
 
 	int rc = SQLITE_ERROR;
 	int intres;
 	simplevt_cursor *svt_cur = (simplevt_cursor*)cur;
-	printf("Colid %i Rowid: %i\n", colid, svt_cur->rowid);
+	//printf("Colid %i Rowid: %i\n", colid, svt_cur->rowid);
 	simplevt_vtab *tab = (simplevt_vtab*)(cur->pVtab);
 	//char **fnames = tab->filenames;
 
@@ -430,6 +455,8 @@ int simplevtColumn(sqlite3_vtab_cursor *cur, sqlite3_context *ctx , int colid){
 			if (!svt_cur->lasttext){
 				perror("Fdopen");
 				goto end;
+			} else {
+				printf("Set lasttext\n");
 			}
 		}
 	}
@@ -442,7 +469,7 @@ int simplevtColumn(sqlite3_vtab_cursor *cur, sqlite3_context *ctx , int colid){
 				}
 			}
 			svt_cur->last_mmap = mmap(0, MAX_MAP_SIZE*sizeof(int), PROT_READ, MAP_FILE|MAP_SHARED, svt_cur->filedesc[colid], 0 /*offset*/);
-	//		printf("Mmap (fd: %i) rowid: %i\n", svt_cur->filedesc[intval], svt_cur->rowid);
+			printf("Mmap (fd: %i) rowid: %i\n", svt_cur->filedesc[colid/////], svt_cur->rowid);
 
 			if (svt_cur->last_mmap == MAP_FAILED){
 				svt_cur->last_mmap = 0;
@@ -457,17 +484,33 @@ int simplevtColumn(sqlite3_vtab_cursor *cur, sqlite3_context *ctx , int colid){
 		int val = ((int*)(svt_cur->last_mmap))[svt_cur->rowid];
 		sqlite3_result_int(ctx, val);
 	} else {
-		//printf("Need row: %i\n", svt_cur->rowid);
+//		printf("Need row: %i\n", svt_cur->rowid);
+		int val = 0;
+		if (-1 == lseek(svt_cur->metafd, sizeof(val)*svt_cur->rowid, SEEK_SET)){
+			perror("Text idx");
+			goto end;
+		}
+		int res = read(svt_cur->metafd, &val, sizeof(val) );
+		if (-1 == res){
+			perror("Text idx2");
+			goto end;
+		} else if(!res){
+			perror("Text idx2 EOF");
+			goto end;
+		}
+
+//		printf ("ptr: %p\n", val);
+		if (-1==fseek(svt_cur->lasttext, val, SEEK_SET)){
+			perror("Text read");
+			goto end;
+		}
+
 		// read text data from binary file. Dunno how long the string is..
 		char *noddy = sqlite3_malloc(1024);
 		int conv;
 
 		conv = fscanf (svt_cur->lasttext, "%[:;!?a-zA-Z0-9.,/ -]", noddy);
 		//printf("Tell: %lu Len: %lu [%s]\n", ftell(svt_cur->lasttext), strlen(noddy), noddy);
-		if (-1 == fseek(svt_cur->lasttext, 1, SEEK_CUR)){ // step over the null
-			perror("Seek:");
-			goto end;
-		}
 
 		if (conv)
 			sqlite3_result_text(ctx, noddy, strlen(noddy), SQLITE_STATIC);
